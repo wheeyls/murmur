@@ -1,0 +1,37 @@
+{
+  "name": "murmur-dev",
+  "version": "0.1.0",
+  "description": "Voice-driven AI frontend editor. Speak changes, see them live.",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "murmur": "./dist/index.js"
+  },
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "build": "tsup src/index.ts --format esm --platform node --target node18 --clean --shims",
+    "start": "node dist/index.js",
+    "demo": "bash scripts/demo.sh",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": ["ai", "voice", "frontend", "editor", "hot-reload", "developer-tools"],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "http-proxy": "^1.18.1",
+    "ws": "^8.18.0",
+    "picocolors": "^1.1.1",
+    "ignore": "^6.0.2"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "tsup": "^8.3.0",
+    "tsx": "^4.19.0",
+    "@types/http-proxy": "^1.17.15",
+    "@types/ws": "^8.5.13",
+    "@types/node": "^22.10.0"
+  }
+}
