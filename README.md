@@ -44,7 +44,7 @@ Murmur sits between your browser and your dev server as a lightweight proxy. It 
 ### Try the demo
 
 ```bash
-git clone https://github.com/YOUR_USER/murmur.git
+git clone https://github.com/wheeyls/murmur.git
 cd murmur
 
 export ANTHROPIC_API_KEY=sk-ant-...  # or OPENAI_API_KEY
