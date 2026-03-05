@@ -2,6 +2,7 @@
 import pc from 'picocolors';
 import { createProxyServer } from './proxy.js';
 import { MurmurWebSocket } from './websocket.js';
+import { MurmurSession } from './core/session.js';
 import type { WSCommandMessage } from './types.js';
 import type { Backend } from './backends/types.js';
 import { BuiltinBackend } from './backends/builtin.js';
@@ -133,12 +134,13 @@ ${pc.bold('Examples:')}
 async function main(): Promise<void> {
   const config = parseArgs(process.argv);
   const backend = createBackend(config);
+  const session = new MurmurSession();
 
   console.log('');
   console.log(pc.bold(pc.magenta('  murmur')) + pc.dim(' — voice-driven AI frontend editor'));
   console.log('');
 
-  const server = createProxyServer({
+  const httpServer = createProxyServer({
     target: config.target,
     port: config.port,
     provider: config.provider,
@@ -147,16 +149,18 @@ async function main(): Promise<void> {
   });
 
   const wsServer = new MurmurWebSocket(
-    server,
+    httpServer,
     async (msg: WSCommandMessage) => {
-      await handleCommand(msg, backend, wsServer);
+      session.commands.enqueue({ transcript: msg.transcript, html: msg.html });
     },
     async () => {
-      await handleUndo(backend, wsServer);
+      session.commands.enqueue({ transcript: '__UNDO__', html: '' });
     },
   );
 
-  server.listen(config.port, () => {
+  httpServer.listen(config.port, () => {
+    session.start(config.port, wsServer);
+
     console.log(pc.dim('  target  → ') + pc.cyan(config.target));
     console.log(pc.dim('  proxy   → ') + pc.cyan(`http://localhost:${config.port}`));
     console.log(pc.dim('  root    → ') + pc.cyan(config.projectRoot));
@@ -173,66 +177,70 @@ async function main(): Promise<void> {
     console.log('');
   });
 
+  runCommandLoop(session, backend);
+
   process.on('SIGINT', () => {
     console.log(pc.dim('\n  Shutting down...'));
-    server.close();
+    session.stop();
+    httpServer.close();
     process.exit(0);
   });
 }
 
-async function handleCommand(
-  msg: WSCommandMessage,
-  backend: Backend,
-  wsServer: MurmurWebSocket,
-): Promise<void> {
-  const transcript = msg.transcript;
-  console.log(pc.dim('  voice → ') + pc.white(transcript));
+async function runCommandLoop(session: MurmurSession, backend: Backend): Promise<void> {
+  while (true) {
+    const result = await session.getCommand();
 
-  wsServer.broadcast({ type: 'status', state: 'processing', transcript });
+    if (result.type === 'shutdown') break;
 
-  try {
-    const result = await backend.processCommand(transcript, msg.html);
-
-    if (!result.success) {
-      console.log(pc.yellow(`  failed: ${result.error}`));
-      wsServer.broadcast({ type: 'status', state: 'error', message: result.error });
-      return;
+    if (result.type === 'undo') {
+      await handleUndo(session, backend);
+      continue;
     }
 
-    console.log(pc.green(`  ✓ ${result.summary}`));
-    if (result.filesChanged) {
-      for (const f of result.filesChanged) {
-        console.log(pc.dim(`    ~ ${f}`));
+    console.log(pc.dim('  voice → ') + pc.white(result.transcript));
+
+    try {
+      const outcome = await backend.processCommand(result.transcript, result.html);
+
+      if (!outcome.success) {
+        console.log(pc.yellow(`  failed: ${outcome.error}`));
+        session.sendStatus('error', outcome.error ?? 'Unknown error');
+        continue;
       }
+
+      console.log(pc.green(`  ✓ ${outcome.summary}`));
+      if (outcome.filesChanged) {
+        for (const f of outcome.filesChanged) {
+          console.log(pc.dim(`    ~ ${f}`));
+        }
+      }
+
+      session.sendStatus('applied', outcome.summary);
+      setTimeout(() => session.reload(), 300);
+
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.log(pc.red(`  error: ${message}`));
+      session.sendStatus('error', message);
     }
-
-    wsServer.broadcast({ type: 'status', state: 'applied', summary: result.summary });
-    setTimeout(() => wsServer.sendReload(), 300);
-
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : String(err);
-    console.log(pc.red(`  error: ${message}`));
-    wsServer.broadcast({ type: 'status', state: 'error', message });
   }
 }
 
-async function handleUndo(
-  backend: Backend,
-  wsServer: MurmurWebSocket,
-): Promise<void> {
+async function handleUndo(session: MurmurSession, backend: Backend): Promise<void> {
   try {
     const result = await backend.undo();
     if (result.success) {
       console.log(pc.dim('  undo applied'));
-      wsServer.broadcast({ type: 'undo_done' });
-      setTimeout(() => wsServer.sendReload(), 300);
+      session.broadcaster?.broadcast({ type: 'undo_done' });
+      setTimeout(() => session.reload(), 300);
     } else {
-      wsServer.broadcast({ type: 'status', state: 'error', message: result.error });
+      session.sendStatus('error', result.error ?? 'Undo failed');
     }
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     console.log(pc.red(`  undo error: ${message}`));
-    wsServer.broadcast({ type: 'status', state: 'error', message: `Undo failed: ${message}` });
+    session.sendStatus('error', `Undo failed: ${message}`);
   }
 }
 

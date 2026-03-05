@@ -6,47 +6,19 @@ import { z } from 'zod';
 import http from 'node:http';
 import { createProxyServer } from './proxy.js';
 import { MurmurWebSocket } from './websocket.js';
+import { MurmurSession } from './core/session.js';
 import type { WSCommandMessage } from './types.js';
 
-interface VoiceCommand {
-  transcript: string;
-  html: string;
-}
-
+const session = new MurmurSession();
 let proxyServer: http.Server | null = null;
-let wsServer: MurmurWebSocket | null = null;
-let proxyPort: number | null = null;
 
-const commandQueue: VoiceCommand[] = [];
-let pendingResolver: ((cmd: VoiceCommand) => void) | null = null;
-
-function notifyCommandAvailable(): void {
+session.commands.onCommandAvailable = () => {
   try {
     server.server.sendResourceUpdated({ uri: 'murmur://commands/pending' });
   } catch {
     // Not connected yet or client doesn't support subscriptions — ignore
   }
-}
-
-function enqueueCommand(cmd: VoiceCommand): void {
-  if (pendingResolver) {
-    const resolve = pendingResolver;
-    pendingResolver = null;
-    resolve(cmd);
-  } else {
-    commandQueue.push(cmd);
-  }
-  notifyCommandAvailable();
-}
-
-function waitForCommand(): Promise<VoiceCommand> {
-  if (commandQueue.length > 0) {
-    return Promise.resolve(commandQueue.shift()!);
-  }
-  return new Promise((resolve) => {
-    pendingResolver = resolve;
-  });
-}
+};
 
 const server = new McpServer({
   name: 'murmur',
@@ -82,25 +54,21 @@ server.registerResource(
     ].join(' '),
     mimeType: 'application/json',
   },
-  async () => {
-    const commands = commandQueue.map((cmd) => ({
-      transcript: cmd.transcript,
-      htmlLength: cmd.html.length,
-    }));
-
-    return {
-      contents: [{
-        uri: 'murmur://commands/pending',
-        mimeType: 'application/json',
-        text: JSON.stringify({
-          count: commandQueue.length,
-          proxyRunning: proxyServer !== null,
-          proxyPort,
-          commands,
-        }),
-      }],
-    };
-  },
+  async () => ({
+    contents: [{
+      uri: 'murmur://commands/pending',
+      mimeType: 'application/json',
+      text: JSON.stringify({
+        count: session.commands.pendingCount,
+        proxyRunning: session.running,
+        proxyPort: session.port,
+        commands: session.commands.pending.map((cmd) => ({
+          transcript: cmd.transcript,
+          htmlLength: cmd.html.length,
+        })),
+      }),
+    }],
+  }),
 );
 
 server.registerResource(
@@ -110,21 +78,18 @@ server.registerResource(
     description: 'Current status of the murmur proxy server.',
     mimeType: 'application/json',
   },
-  async () => {
-    return {
-      contents: [{
-        uri: 'murmur://status',
-        mimeType: 'application/json',
-        text: JSON.stringify({
-          running: proxyServer !== null,
-          port: proxyPort,
-          pendingCommands: commandQueue.length,
-          hasWaitingConsumer: pendingResolver !== null,
-        }),
-      }],
-    };
-  },
+  async () => ({
+    contents: [{
+      uri: 'murmur://status',
+      mimeType: 'application/json',
+      text: JSON.stringify(session.getStatus()),
+    }],
+  }),
 );
+
+function text(t: string) {
+  return { content: [{ type: 'text' as const, text: t }] };
+}
 
 server.registerTool(
   'murmur_start',
@@ -141,29 +106,24 @@ server.registerTool(
     }),
   },
   async ({ target, port }) => {
-    if (proxyServer) {
-      return {
-        content: [{ type: 'text' as const, text: `Proxy already running on port ${proxyPort}. Stop it first with murmur_stop.` }],
-      };
+    if (session.running) {
+      return text(`Proxy already running on port ${session.port}. Stop it first with murmur_stop.`);
     }
 
-    const config = {
+    proxyServer = createProxyServer({
       target,
       port,
       provider: 'anthropic' as const,
       projectRoot: process.cwd(),
-    };
+    });
 
-    proxyServer = createProxyServer(config);
-    proxyPort = port;
-
-    wsServer = new MurmurWebSocket(
+    const wsServer = new MurmurWebSocket(
       proxyServer,
       async (msg: WSCommandMessage) => {
-        enqueueCommand({ transcript: msg.transcript, html: msg.html });
+        session.commands.enqueue({ transcript: msg.transcript, html: msg.html });
       },
       async () => {
-        enqueueCommand({ transcript: '__UNDO__', html: '' });
+        session.commands.enqueue({ transcript: '__UNDO__', html: '' });
       },
     );
 
@@ -171,18 +131,15 @@ server.registerTool(
       proxyServer!.listen(port, () => resolve());
     });
 
-    return {
-      content: [{
-        type: 'text' as const,
-        text: [
-          `Murmur proxy started.`,
-          `Proxying: ${target} → http://localhost:${port}`,
-          `Tell the user to open http://localhost:${port} in Chrome.`,
-          `The page will show their app with a floating mic button.`,
-          `Call murmur_get_command to wait (blocking), or subscribe to murmur://commands/pending for event-driven updates.`,
-        ].join('\n'),
-      }],
-    };
+    session.start(port, wsServer);
+
+    return text([
+      `Murmur proxy started.`,
+      `Proxying: ${target} → http://localhost:${port}`,
+      `Tell the user to open http://localhost:${port} in Chrome.`,
+      `The page will show their app with a floating mic button.`,
+      `Call murmur_get_command to wait (blocking), or subscribe to murmur://commands/pending for event-driven updates.`,
+    ].join('\n'));
   },
 );
 
@@ -201,32 +158,23 @@ server.registerTool(
     inputSchema: z.object({}),
   },
   async () => {
-    if (!proxyServer) {
-      return {
-        content: [{ type: 'text' as const, text: 'Proxy not running. Call murmur_start first.' }],
-      };
+    if (!session.running) return text('Proxy not running. Call murmur_start first.');
+
+    const result = await session.getCommand();
+
+    switch (result.type) {
+      case 'undo':
+        return text('UNDO requested. Revert your last file changes, then call murmur_send_status with state "applied" and call murmur_reload.');
+      case 'shutdown':
+        return text('Server shutting down.');
+      case 'command':
+        return {
+          content: [
+            { type: 'text' as const, text: `Voice command: "${result.transcript}"` },
+            { type: 'text' as const, text: `Page HTML (what the user sees):\n${result.html}` },
+          ],
+        };
     }
-
-    const cmd = await waitForCommand();
-
-    if (cmd.transcript === '__UNDO__') {
-      return {
-        content: [{ type: 'text' as const, text: 'UNDO requested. Revert your last file changes, then call murmur_send_status with state "applied" and call murmur_reload.' }],
-      };
-    }
-
-    wsServer?.broadcast({ type: 'status', state: 'processing', transcript: cmd.transcript });
-
-    const truncatedHtml = cmd.html.length > 60_000
-      ? cmd.html.slice(0, 60_000) + '\n<!-- truncated -->'
-      : cmd.html;
-
-    return {
-      content: [
-        { type: 'text' as const, text: `Voice command: "${cmd.transcript}"` },
-        { type: 'text' as const, text: `Page HTML (what the user sees):\n${truncatedHtml}` },
-      ],
-    };
   },
 );
 
@@ -245,38 +193,24 @@ server.registerTool(
     inputSchema: z.object({}),
   },
   async () => {
-    if (!proxyServer) {
-      return {
-        content: [{ type: 'text' as const, text: 'Proxy not running. Call murmur_start first.' }],
-      };
+    if (!session.running) return text('Proxy not running. Call murmur_start first.');
+
+    const result = session.readCommand();
+    if (!result) return text('No pending commands.');
+
+    switch (result.type) {
+      case 'undo':
+        return text('UNDO requested. Revert your last file changes, then call murmur_send_status with state "applied" and call murmur_reload.');
+      case 'shutdown':
+        return text('Server shutting down.');
+      case 'command':
+        return {
+          content: [
+            { type: 'text' as const, text: `Voice command: "${result.transcript}"` },
+            { type: 'text' as const, text: `Page HTML (what the user sees):\n${result.html}` },
+          ],
+        };
     }
-
-    if (commandQueue.length === 0) {
-      return {
-        content: [{ type: 'text' as const, text: 'No pending commands.' }],
-      };
-    }
-
-    const cmd = commandQueue.shift()!;
-
-    if (cmd.transcript === '__UNDO__') {
-      return {
-        content: [{ type: 'text' as const, text: 'UNDO requested. Revert your last file changes, then call murmur_send_status with state "applied" and call murmur_reload.' }],
-      };
-    }
-
-    wsServer?.broadcast({ type: 'status', state: 'processing', transcript: cmd.transcript });
-
-    const truncatedHtml = cmd.html.length > 60_000
-      ? cmd.html.slice(0, 60_000) + '\n<!-- truncated -->'
-      : cmd.html;
-
-    return {
-      content: [
-        { type: 'text' as const, text: `Voice command: "${cmd.transcript}"` },
-        { type: 'text' as const, text: `Page HTML (what the user sees):\n${truncatedHtml}` },
-      ],
-    };
   },
 );
 
@@ -295,23 +229,9 @@ server.registerTool(
     }),
   },
   async ({ state, message }) => {
-    if (!wsServer) {
-      return {
-        content: [{ type: 'text' as const, text: 'Proxy not running.' }],
-      };
-    }
-
-    if (state === 'applied') {
-      wsServer.broadcast({ type: 'status', state: 'applied', summary: message });
-    } else if (state === 'error') {
-      wsServer.broadcast({ type: 'status', state: 'error', message });
-    } else {
-      wsServer.broadcast({ type: 'status', state: 'processing', transcript: message });
-    }
-
-    return {
-      content: [{ type: 'text' as const, text: `Status sent: ${state} — "${message}"` }],
-    };
+    if (!session.running) return text('Proxy not running.');
+    session.sendStatus(state, message);
+    return text(`Status sent: ${state} — "${message}"`);
   },
 );
 
@@ -327,16 +247,9 @@ server.registerTool(
     inputSchema: z.object({}),
   },
   async () => {
-    if (!wsServer) {
-      return {
-        content: [{ type: 'text' as const, text: 'Proxy not running.' }],
-      };
-    }
-
-    wsServer.sendReload();
-    return {
-      content: [{ type: 'text' as const, text: 'Reload signal sent to browser.' }],
-    };
+    if (!session.running) return text('Proxy not running.');
+    session.reload();
+    return text('Reload signal sent to browser.');
   },
 );
 
@@ -348,24 +261,13 @@ server.registerTool(
     inputSchema: z.object({}),
   },
   async () => {
-    if (!proxyServer) {
-      return {
-        content: [{ type: 'text' as const, text: 'Proxy not running.' }],
-      };
-    }
+    if (!session.running) return text('Proxy not running.');
 
-    proxyServer.close();
+    proxyServer?.close();
     proxyServer = null;
-    wsServer = null;
+    session.stop();
 
-    if (pendingResolver) {
-      pendingResolver({ transcript: '__SHUTDOWN__', html: '' });
-      pendingResolver = null;
-    }
-
-    return {
-      content: [{ type: 'text' as const, text: 'Murmur proxy stopped.' }],
-    };
+    return text('Murmur proxy stopped.');
   },
 );
 

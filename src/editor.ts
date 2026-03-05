@@ -178,10 +178,7 @@ export async function undoEdits(
   }
 }
 
-/**
- * Find and replace with fallback strategies.
- */
-function findAndReplace(
+export function findAndReplace(
   content: string,
   search: string,
   replace: string,

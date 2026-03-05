@@ -27,6 +27,22 @@ export interface VoiceCommand {
   html: string;
 }
 
+export const UNDO_TRANSCRIPT = '__UNDO__';
+export const SHUTDOWN_TRANSCRIPT = '__SHUTDOWN__';
+
+export function isUndo(cmd: VoiceCommand): boolean {
+  return cmd.transcript === UNDO_TRANSCRIPT;
+}
+
+export function isShutdown(cmd: VoiceCommand): boolean {
+  return cmd.transcript === SHUTDOWN_TRANSCRIPT;
+}
+
+export function truncateHtml(html: string, maxLength = 60_000): string {
+  if (html.length <= maxLength) return html;
+  return html.slice(0, maxLength) + '\n<!-- truncated -->';
+}
+
 export interface MurmurConfig {
   target: string;
   port: number;

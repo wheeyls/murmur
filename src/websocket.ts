@@ -1,11 +1,12 @@
 import { WebSocketServer, WebSocket } from 'ws';
 import type http from 'node:http';
-import type { WSMessage, WSCommandMessage, WSStatusMessage } from './types.js';
+import type { WSMessage, WSCommandMessage } from './types.js';
+import type { Broadcaster } from './core/session.js';
 
 type CommandHandler = (msg: WSCommandMessage) => Promise<void>;
 type UndoHandler = () => Promise<void>;
 
-export class MurmurWebSocket {
+export class MurmurWebSocket implements Broadcaster {
   private wss: WebSocketServer;
   private clients: Set<WebSocket> = new Set();
   private onCommand: CommandHandler;
@@ -51,7 +52,7 @@ export class MurmurWebSocket {
     }
   }
 
-  broadcast(msg: WSStatusMessage | { type: string; [key: string]: unknown }): void {
+  broadcast(msg: Record<string, unknown>): void {
     const data = JSON.stringify(msg);
     for (const client of this.clients) {
       if (client.readyState === WebSocket.OPEN) {
