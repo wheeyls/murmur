@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { SubscribeRequestSchema, UnsubscribeRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import http from 'node:http';
 import { createProxyServer } from './proxy.js';
@@ -19,6 +20,14 @@ let proxyPort: number | null = null;
 const commandQueue: VoiceCommand[] = [];
 let pendingResolver: ((cmd: VoiceCommand) => void) | null = null;
 
+function notifyCommandAvailable(): void {
+  try {
+    server.server.sendResourceUpdated({ uri: 'murmur://commands/pending' });
+  } catch {
+    // Not connected yet or client doesn't support subscriptions — ignore
+  }
+}
+
 function enqueueCommand(cmd: VoiceCommand): void {
   if (pendingResolver) {
     const resolve = pendingResolver;
@@ -27,6 +36,7 @@ function enqueueCommand(cmd: VoiceCommand): void {
   } else {
     commandQueue.push(cmd);
   }
+  notifyCommandAvailable();
 }
 
 function waitForCommand(): Promise<VoiceCommand> {
@@ -42,8 +52,79 @@ const server = new McpServer({
   name: 'murmur',
   version: '0.2.0',
 }, {
-  capabilities: { logging: {} },
+  capabilities: {
+    logging: {},
+    resources: { subscribe: true },
+  },
 });
+
+const subscribedUris = new Set<string>();
+
+server.server.setRequestHandler(SubscribeRequestSchema, async (request) => {
+  subscribedUris.add(request.params.uri);
+  return {};
+});
+
+server.server.setRequestHandler(UnsubscribeRequestSchema, async (request) => {
+  subscribedUris.delete(request.params.uri);
+  return {};
+});
+
+server.registerResource(
+  'pending_commands',
+  'murmur://commands/pending',
+  {
+    description: [
+      'Pending voice commands from the browser overlay.',
+      'Subscribe to this resource to get notified when new voice commands arrive.',
+      'Read it to get the current queue of unprocessed commands.',
+      'This is an event-driven alternative to the blocking murmur_get_command tool.',
+    ].join(' '),
+    mimeType: 'application/json',
+  },
+  async () => {
+    const commands = commandQueue.map((cmd) => ({
+      transcript: cmd.transcript,
+      htmlLength: cmd.html.length,
+    }));
+
+    return {
+      contents: [{
+        uri: 'murmur://commands/pending',
+        mimeType: 'application/json',
+        text: JSON.stringify({
+          count: commandQueue.length,
+          proxyRunning: proxyServer !== null,
+          proxyPort,
+          commands,
+        }),
+      }],
+    };
+  },
+);
+
+server.registerResource(
+  'status',
+  'murmur://status',
+  {
+    description: 'Current status of the murmur proxy server.',
+    mimeType: 'application/json',
+  },
+  async () => {
+    return {
+      contents: [{
+        uri: 'murmur://status',
+        mimeType: 'application/json',
+        text: JSON.stringify({
+          running: proxyServer !== null,
+          port: proxyPort,
+          pendingCommands: commandQueue.length,
+          hasWaitingConsumer: pendingResolver !== null,
+        }),
+      }],
+    };
+  },
+);
 
 server.registerTool(
   'murmur_start',
@@ -98,7 +179,7 @@ server.registerTool(
           `Proxying: ${target} → http://localhost:${port}`,
           `Tell the user to open http://localhost:${port} in Chrome.`,
           `The page will show their app with a floating mic button.`,
-          `Call murmur_get_command to wait for the user's first voice command.`,
+          `Call murmur_get_command to wait (blocking), or subscribe to murmur://commands/pending for event-driven updates.`,
         ].join('\n'),
       }],
     };
@@ -127,6 +208,56 @@ server.registerTool(
     }
 
     const cmd = await waitForCommand();
+
+    if (cmd.transcript === '__UNDO__') {
+      return {
+        content: [{ type: 'text' as const, text: 'UNDO requested. Revert your last file changes, then call murmur_send_status with state "applied" and call murmur_reload.' }],
+      };
+    }
+
+    wsServer?.broadcast({ type: 'status', state: 'processing', transcript: cmd.transcript });
+
+    const truncatedHtml = cmd.html.length > 60_000
+      ? cmd.html.slice(0, 60_000) + '\n<!-- truncated -->'
+      : cmd.html;
+
+    return {
+      content: [
+        { type: 'text' as const, text: `Voice command: "${cmd.transcript}"` },
+        { type: 'text' as const, text: `Page HTML (what the user sees):\n${truncatedHtml}` },
+      ],
+    };
+  },
+);
+
+server.registerTool(
+  'murmur_read_command',
+  {
+    title: 'Read Pending Command',
+    description: [
+      'Non-blocking read of the next pending voice command.',
+      'Use this after receiving a notifications/resources/updated event for murmur://commands/pending.',
+      'Returns the next command if one is queued, or indicates the queue is empty.',
+      'Unlike murmur_get_command, this does NOT block — it returns immediately.',
+      'After receiving a command, edit the source files, then call murmur_send_status.',
+      'If transcript is "__UNDO__", the user clicked the undo button.',
+    ].join(' '),
+    inputSchema: z.object({}),
+  },
+  async () => {
+    if (!proxyServer) {
+      return {
+        content: [{ type: 'text' as const, text: 'Proxy not running. Call murmur_start first.' }],
+      };
+    }
+
+    if (commandQueue.length === 0) {
+      return {
+        content: [{ type: 'text' as const, text: 'No pending commands.' }],
+      };
+    }
+
+    const cmd = commandQueue.shift()!;
 
     if (cmd.transcript === '__UNDO__') {
       return {

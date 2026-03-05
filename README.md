@@ -129,9 +129,30 @@ Add to `claude_desktop_config.json`:
 |------|-------------|
 | `murmur_start` | Start proxy on target URL. Injects overlay widget into the page. |
 | `murmur_get_command` | **Blocks** until user speaks or types. Returns transcript + page HTML. |
+| `murmur_read_command` | **Non-blocking** read of the next pending command. Use with resource subscriptions. |
 | `murmur_send_status` | Push status to overlay: "processing", "applied", or "error". |
 | `murmur_reload` | Trigger browser page reload (fallback when HMR doesn't fire). |
 | `murmur_stop` | Stop the proxy and clean up. |
+
+### MCP Resources
+
+Murmur exposes resources that MCP hosts can subscribe to for event-driven updates:
+
+| Resource | Description |
+|----------|-------------|
+| `murmur://commands/pending` | Pending voice commands. Subscribe to get `notifications/resources/updated` when a user speaks. |
+| `murmur://status` | Proxy status — whether it's running, port, queue depth. |
+
+**Event-driven flow** (alternative to blocking `murmur_get_command`):
+
+1. Agent calls `murmur_start` to start the proxy
+2. Agent subscribes to `murmur://commands/pending`
+3. User speaks into the mic
+4. Server sends `notifications/resources/updated` for `murmur://commands/pending`
+5. Agent calls `murmur_read_command` to get the command (non-blocking)
+6. Agent edits files, calls `murmur_send_status`
+
+This is useful for MCP hosts that support resource subscriptions and can react to notifications. Hosts that don't support subscriptions can use the blocking `murmur_get_command` tool instead.
 
 ### Why MCP over standalone?
 
