@@ -15,29 +15,31 @@ Murmur sits between your browser and your dev server as a lightweight proxy. It 
 ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
 │   Browser    │◄───►│   Murmur    │◄───►│  Dev Server  │
 │  (your app   │     │  (proxy +   │     │  (vite, next,│
-│  + mic widget│     │   routing)  │     │  rails, etc) │
+│  + mic widget│     │   MCP)      │     │  rails, etc) │
 └─────────────┘     └─────────────┘     └─────────────┘
-       │                    │
-       │  voice command     │  edits files on disk
+       │                    ▲
+       │  voice command     │  MCP tool calls
        │  + page HTML       │
-       │                    ▼
-       ▼              ┌──────────────┐
-   Web Speech API     │   Backend    │
+       ▼                    ▼
+   Web Speech API     ┌──────────────┐
+                      │  AI Agent    │
                       │              │
-                      │ • builtin    │  ← direct API calls
-                      │ • claude-code│  ← claude CLI (best)
-                      │ • opencode   │  ← opencode CLI
-                      │ • pipe       │  ← any external tool
+                      │ Claude Desktop│
+                      │ OpenCode     │
+                      │ Cursor       │
+                      │ (any MCP host)│
                       └──────────────┘
 ```
 
-**The loop:**
+**The loop (MCP — recommended):**
 1. You see your app in the browser
 2. You click the mic (or press `/` to type)
-3. You describe what you want changed
-4. The backend edits your source files
-5. Your dev server hot-reloads the page
-6. You see the result. Repeat.
+3. The AI agent receives your command via `murmur_get_command`
+4. The agent edits files using its full tool suite (LSP, grep, etc.)
+5. The agent calls `murmur_send_status` → overlay shows "Done!"
+6. Your dev server hot-reloads the page. Repeat.
+
+**Standalone mode** also available — murmur handles AI calls itself via `--backend builtin`.
 
 ## Quick start
 
@@ -76,9 +78,71 @@ npx tsx src/index.ts http://localhost:3000 --root /path/to/your-project
 # 4. Click the mic and speak
 ```
 
-## Backends
+## MCP Server (recommended)
 
-Murmur supports multiple AI backends. Choose the one that fits your workflow.
+The best way to use murmur is as an MCP server. Your AI agent (Claude Desktop, OpenCode, Cursor, etc.) connects to murmur and receives voice commands directly — using its full tool suite to make edits.
+
+### OpenCode
+
+Add to your OpenCode MCP config (`~/.config/opencode/opencode.json`):
+
+```json
+{
+  "mcp": {
+    "murmur": {
+      "command": "npx",
+      "args": ["tsx", "/path/to/murmur/src/mcp.ts"]
+    }
+  }
+}
+```
+
+Then in an OpenCode session:
+
+```
+You: Start murmur on my dev server at localhost:3000
+Agent: [calls murmur_start] → proxy running on :4444
+Agent: [calls murmur_get_command] → waiting for voice...
+You: (speak into mic) "make the header blue"
+Agent: [receives command] → edits files → [calls murmur_send_status("applied")]
+Agent: [calls murmur_get_command] → waiting for next...
+```
+
+### Claude Desktop
+
+Add to `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "murmur": {
+      "command": "npx",
+      "args": ["tsx", "/path/to/murmur/src/mcp.ts"]
+    }
+  }
+}
+```
+
+### MCP Tools
+
+| Tool | Description |
+|------|-------------|
+| `murmur_start` | Start proxy on target URL. Injects overlay widget into the page. |
+| `murmur_get_command` | **Blocks** until user speaks or types. Returns transcript + page HTML. |
+| `murmur_send_status` | Push status to overlay: "processing", "applied", or "error". |
+| `murmur_reload` | Trigger browser page reload (fallback when HMR doesn't fire). |
+| `murmur_stop` | Stop the proxy and clean up. |
+
+### Why MCP over standalone?
+
+- The agent uses its **real tools** — LSP diagnostics, grep, multi-file editing, AST — not a simple SEARCH/REPLACE parser
+- **Full conversation context** — no subprocess spawning, no token re-sending
+- **Bidirectional** — agent pushes real-time status to the overlay
+- **Works with any MCP host** — Claude Desktop, OpenCode, Cursor, Windsurf, Cline
+
+## Backends (standalone mode)
+
+Murmur also runs standalone without an MCP host. Choose a backend:
 
 ### `builtin` (default)
 
@@ -252,6 +316,7 @@ murmur/
 │   │   ├── builtin.ts        Direct API calls (Anthropic/OpenAI)
 │   │   ├── claude-code.ts    Claude Code + OpenCode CLI backends
 │   │   └── pipe.ts           File-based pipe (universal)
+│   ├── mcp.ts                MCP server entry point (stdio)
 │   ├── ai.ts                 AI API integration (used by builtin)
 │   ├── editor.ts             Edit parser + file applier
 │   ├── context.ts            Project file gatherer
@@ -270,7 +335,7 @@ murmur/
 - **Reference what you see** — "the blue button in the header" helps the AI locate elements
 - **Iterate** — make small changes and build up. The AI remembers your conversation.
 - **Use undo freely** — every change is reversible. Experiment without fear.
-- **Use claude-code or opencode backends** — they produce better edits than builtin because they have LSP and can verify their work
+- **Use MCP mode** — connect via Claude Desktop or OpenCode for the best edits (full tool suite, LSP, etc.)
 
 ## Limitations
 
